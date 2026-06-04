@@ -1,6 +1,5 @@
-// has only 5 functions: getDateRange, formatDateTime, addCommonFilters, getReportFilters and getReports.
-
 const db = require("../db");
+const { models, helpers } = db;
 
 const emptyReport = {
   summary: {
@@ -45,50 +44,22 @@ function getDateRange(query) {
     end.setHours(23, 59, 59, 999);
   }
 
-  if (!start) return null;
-
-  return {
-    start: formatDateTime(start),
-    end: formatDateTime(end),
-  };
+  return start ? { start, end } : null;
 }
 
-function formatDateTime(date) {
-  const pad = (value) => String(value).padStart(2, "0");
-
-  return [
-    date.getFullYear(),
-    pad(date.getMonth() + 1),
-    pad(date.getDate()),
-  ].join("-") + " " + [
-    pad(date.getHours()),
-    pad(date.getMinutes()),
-    pad(date.getSeconds()),
-  ].join(":");
+function inRange(row, range) {
+  if (!range) return true;
+  const date = new Date(row.created_at);
+  return date >= range.start && date <= range.end;
 }
 
-function addCommonFilters(parts, params, query, alias, dateField) {
-  const range = getDateRange(query);
-
-  if (range) {
-    parts.push(`${alias}.${dateField} BETWEEN ? AND ?`);
-    params.push(range.start, range.end);
-  }
-
-  if (query.shop_id && query.shop_id !== "all") {
-    parts.push(`${alias}.shop_id = ?`);
-    params.push(query.shop_id);
-  }
-
-  if (query.product_id && query.product_id !== "all") {
-    parts.push(`${alias}.product_id = ?`);
-    params.push(query.product_id);
-  }
-}
-
-async function runQuery(sql, params = []) {
-  const [rows] = await db.promise().query(sql, params);
-  return rows;
+function groupSum(rows, keyFn, valueFn) {
+  const map = new Map();
+  rows.forEach((row) => {
+    const key = keyFn(row);
+    map.set(key, (map.get(key) || 0) + valueFn(row));
+  });
+  return map;
 }
 
 exports.getReportFilters = async (req, res) => {
@@ -99,15 +70,16 @@ exports.getReportFilters = async (req, res) => {
   }
 
   try {
+    await db.connect();
     const [shops, products] = await Promise.all([
-      runQuery(
-        `SELECT id, shop_name FROM shops WHERE user_id = ? AND status = 'active' ORDER BY shop_name ASC`,
-        [user_id]
-      ),
-      runQuery(
-        `SELECT id, product_name, product_code FROM products WHERE user_id = ? AND status = 'active' ORDER BY product_name ASC`,
-        [user_id]
-      ),
+      models.Shop.find({ user_id: helpers.toId(user_id), status: "active" })
+        .sort({ shop_name: 1 })
+        .select("id shop_name -_id")
+        .lean(),
+      models.Product.find({ user_id: helpers.toId(user_id), status: "active" })
+        .sort({ product_name: 1 })
+        .select("id product_name product_code -_id")
+        .lean(),
     ]);
 
     res.json({ shops, products });
@@ -124,339 +96,220 @@ exports.getReports = async (req, res) => {
     return res.status(400).json({ message: "user_id is required" });
   }
 
-  const includeSales = !transaction_type || transaction_type === "all" || transaction_type === "sales";
-  const includeReturns = !transaction_type || transaction_type === "all" || transaction_type === "returns";
-  const includeAdvances = !transaction_type || transaction_type === "all" || transaction_type === "advances";
-
   try {
-    const salesWhere = ["sh.user_id = ?"];
-    const salesParams = [user_id];
-    addCommonFilters(salesWhere, salesParams, req.query, "s", "created_at");
+    await db.connect();
 
-    const returnsWhere = ["sh.user_id = ?"];
-    const returnsParams = [user_id];
-    addCommonFilters(returnsWhere, returnsParams, req.query, "r", "created_at");
+    const uid = helpers.toId(user_id);
+    const range = getDateRange(req.query);
+    const includeSales = !transaction_type || transaction_type === "all" || transaction_type === "sales";
+    const includeReturns = !transaction_type || transaction_type === "all" || transaction_type === "returns";
+    const includeAdvances = !transaction_type || transaction_type === "all" || transaction_type === "advances";
 
-    const advanceWhere = ["sh.user_id = ?"];
-    const advanceParams = [user_id];
-    const advanceRange = getDateRange(req.query);
-    if (advanceRange) {
-      advanceWhere.push("ap.created_at BETWEEN ? AND ?");
-      advanceParams.push(advanceRange.start, advanceRange.end);
-    }
-    if (req.query.shop_id && req.query.shop_id !== "all") {
-      advanceWhere.push("ap.shop_id = ?");
-      advanceParams.push(req.query.shop_id);
-    }
-
-    const salesWhereSql = salesWhere.join(" AND ");
-    const returnsWhereSql = returnsWhere.join(" AND ");
-    const advanceWhereSql = advanceWhere.join(" AND ");
-
-    const report = { ...emptyReport };
-
-    const salesSummaryPromise = includeSales
-      ? runQuery(
-          `SELECT
-             COALESCE(SUM(s.total_amount), 0) AS totalSales,
-             COALESCE(SUM(s.artisan_earnings * s.quantity), 0) AS totalArtisanEarnings,
-             COALESCE(SUM(s.commission_amount * s.quantity), 0) AS totalShopEarnings,
-             COALESCE(SUM(s.quantity), 0) AS productsSold
-           FROM sales s
-           JOIN shops sh ON s.shop_id = sh.id
-           WHERE ${salesWhereSql}`,
-          salesParams
-        )
-      : Promise.resolve([{}]);
-
-    const returnsSummaryPromise = includeReturns
-      ? runQuery(
-          `SELECT
-             COALESCE(SUM(r.quantity), 0) AS totalReturnsQuantity,
-             COALESCE(SUM(r.quantity * COALESCE(si.artisan_price, p.base_price, 0)), 0) AS totalReturnsValue
-           FROM returns r
-           JOIN shops sh ON r.shop_id = sh.id
-           JOIN products p ON r.product_id = p.id
-           LEFT JOIN shop_inventory si ON r.shop_id = si.shop_id AND r.product_id = si.product_id
-           WHERE ${returnsWhereSql}`,
-          returnsParams
-        )
-      : Promise.resolve([{}]);
-
-    const advancesSummaryPromise = includeAdvances
-      ? runQuery(
-          `SELECT COALESCE(SUM(ap.amount), 0) AS totalAdvancePayments
-           FROM advance_payments ap
-           JOIN shops sh ON ap.shop_id = sh.id
-           WHERE ${advanceWhereSql}`,
-          advanceParams
-        )
-      : Promise.resolve([{}]);
-
-    const [
-      salesSummaryRows,
-      returnsSummaryRows,
-      advancesSummaryRows,
-      salesOverTime,
-      earningsComparison,
-      topCategories,
-      topProducts,
-      topShops,
-      lowStock,
-      returnsReport,
-      advancePayments,
-      inventoryMovement,
-      profitability,
-      shopSettlement,
-    ] = await Promise.all([
-      salesSummaryPromise,
-      returnsSummaryPromise,
-      advancesSummaryPromise,
-      includeSales
-        ? runQuery(
-            `SELECT
-               DATE(s.created_at) AS period,
-               COALESCE(SUM(s.total_amount), 0) AS sales
-             FROM sales s
-             JOIN shops sh ON s.shop_id = sh.id
-             WHERE ${salesWhereSql}
-             GROUP BY DATE(s.created_at)
-             ORDER BY period ASC`,
-            salesParams
-          )
-        : Promise.resolve([]),
-      includeSales
-        ? runQuery(
-            `SELECT
-               'Artisan Earnings' AS name,
-               COALESCE(SUM(s.artisan_earnings * s.quantity), 0) AS value
-             FROM sales s
-             JOIN shops sh ON s.shop_id = sh.id
-             WHERE ${salesWhereSql}
-             UNION ALL
-             SELECT
-               'Shop Earnings' AS name,
-               COALESCE(SUM(s.commission_amount * s.quantity), 0) AS value
-             FROM sales s
-             JOIN shops sh ON s.shop_id = sh.id
-             WHERE ${salesWhereSql}`,
-            [...salesParams, ...salesParams]
-          )
-        : Promise.resolve([]),
-      includeSales
-        ? runQuery(
-            `SELECT
-               COALESCE(p.category, 'Uncategorized') AS name,
-               COALESCE(SUM(s.quantity), 0) AS value
-             FROM sales s
-             JOIN shops sh ON s.shop_id = sh.id
-             JOIN products p ON s.product_id = p.id
-             WHERE ${salesWhereSql}
-             GROUP BY p.category
-             ORDER BY value DESC`,
-            salesParams
-          )
-        : Promise.resolve([]),
-      includeSales
-        ? runQuery(
-            `SELECT
-               p.product_name,
-               p.product_code,
-               COALESCE(SUM(s.quantity), 0) AS total_sold,
-               COALESCE(SUM(s.total_amount), 0) AS revenue,
-               COALESCE(SUM(s.artisan_earnings * s.quantity), 0) AS artisan_earnings,
-               COALESCE(SUM(s.commission_amount * s.quantity), 0) AS shop_earnings
-             FROM sales s
-             JOIN shops sh ON s.shop_id = sh.id
-             JOIN products p ON s.product_id = p.id
-             WHERE ${salesWhereSql}
-             GROUP BY p.id, p.product_name, p.product_code
-             ORDER BY total_sold DESC, revenue DESC
-             LIMIT 10`,
-            salesParams
-          )
-        : Promise.resolve([]),
-      includeSales
-        ? runQuery(
-            `SELECT
-               sh.shop_name,
-               COALESCE(SUM(s.total_amount), 0) AS total_sales,
-               COALESCE(SUM(s.quantity), 0) AS products_sold,
-               COALESCE(SUM(s.artisan_earnings * s.quantity), 0) AS artisan_earnings,
-               COALESCE(SUM(s.commission_amount * s.quantity), 0) AS shop_earnings
-             FROM sales s
-             JOIN shops sh ON s.shop_id = sh.id
-             WHERE ${salesWhereSql}
-             GROUP BY sh.id, sh.shop_name
-             ORDER BY total_sales DESC
-             LIMIT 10`,
-            salesParams
-          )
-        : Promise.resolve([]),
-      runQuery(
-        `SELECT
-           p.product_name,
-           COALESCE(mi.quantity, 0) AS current_stock,
-           COALESCE(p.minimum_stock, 0) AS minimum_stock,
-           CASE
-             WHEN COALESCE(mi.quantity, 0) <= 0 THEN 'Critical'
-             WHEN COALESCE(mi.quantity, 0) <= COALESCE(p.minimum_stock, 0) THEN 'Low'
-             ELSE 'Safe'
-           END AS status
-         FROM products p
-         LEFT JOIN main_inventory mi ON p.id = mi.product_id
-         WHERE p.user_id = ? AND p.status = 'active'
-         ORDER BY
-           CASE
-             WHEN COALESCE(mi.quantity, 0) <= 0 THEN 1
-             WHEN COALESCE(mi.quantity, 0) <= COALESCE(p.minimum_stock, 0) THEN 2
-             ELSE 3
-           END,
-           p.product_name ASC`,
-        [user_id]
-      ),
-      includeReturns
-        ? runQuery(
-            `SELECT
-               r.created_at,
-               p.product_name,
-               sh.shop_name,
-               r.quantity,
-               r.reason,
-               r.status
-             FROM returns r
-             JOIN shops sh ON r.shop_id = sh.id
-             JOIN products p ON r.product_id = p.id
-             WHERE ${returnsWhereSql}
-             ORDER BY r.created_at DESC
-             LIMIT 50`,
-            returnsParams
-          )
-        : Promise.resolve([]),
-      includeAdvances
-        ? runQuery(
-            `SELECT
-               sh.shop_name,
-               ap.amount,
-               ap.note,
-               ap.created_at
-             FROM advance_payments ap
-             JOIN shops sh ON ap.shop_id = sh.id
-             WHERE ${advanceWhereSql}
-             ORDER BY ap.created_at DESC
-             LIMIT 50`,
-            advanceParams
-          )
-        : Promise.resolve([]),
-      runQuery(
-        `SELECT
-           p.product_name,
-           COALESCE(mi.quantity, 0) + COALESCE(assigned.assigned, 0) AS initial_quantity,
-           COALESCE(assigned.assigned, 0) AS assigned,
-           COALESCE(sold.sold, 0) AS sold,
-           COALESCE(returned.returned, 0) AS returned,
-           0 AS damaged,
-           COALESCE(mi.quantity, 0) + COALESCE(shop_remaining.remaining, 0) AS remaining
-         FROM products p
-         LEFT JOIN main_inventory mi ON p.id = mi.product_id
-         LEFT JOIN (
-           SELECT si.product_id, SUM(si.quantity) + COALESCE(SUM(sold_by_product.sold), 0) + COALESCE(SUM(returned_by_product.returned), 0) AS assigned
-           FROM shop_inventory si
-           LEFT JOIN (
-             SELECT shop_id, product_id, SUM(quantity) AS sold
-             FROM sales
-             GROUP BY shop_id, product_id
-           ) sold_by_product ON si.shop_id = sold_by_product.shop_id AND si.product_id = sold_by_product.product_id
-           LEFT JOIN (
-             SELECT shop_id, product_id, SUM(quantity) AS returned
-             FROM returns
-             GROUP BY shop_id, product_id
-           ) returned_by_product ON si.shop_id = returned_by_product.shop_id AND si.product_id = returned_by_product.product_id
-           GROUP BY si.product_id
-         ) assigned ON p.id = assigned.product_id
-         LEFT JOIN (
-           SELECT product_id, SUM(quantity) AS sold
-           FROM sales
-           GROUP BY product_id
-         ) sold ON p.id = sold.product_id
-         LEFT JOIN (
-           SELECT product_id, SUM(quantity) AS returned
-           FROM returns
-           WHERE status = 'confirmed'
-           GROUP BY product_id
-         ) returned ON p.id = returned.product_id
-         LEFT JOIN (
-           SELECT product_id, SUM(quantity) AS remaining
-           FROM shop_inventory
-           GROUP BY product_id
-         ) shop_remaining ON p.id = shop_remaining.product_id
-         WHERE p.user_id = ? AND p.status = 'active'
-         ORDER BY p.product_name ASC`,
-        [user_id]
-      ),
-      includeSales
-        ? runQuery(
-            `SELECT
-               p.product_name,
-               COALESCE(SUM(s.total_amount), 0) AS revenue,
-               COALESCE(SUM(s.artisan_earnings * s.quantity), 0) AS artisan_profit,
-               COALESCE(SUM(s.commission_amount * s.quantity), 0) AS shop_profit,
-               COALESCE(SUM(s.artisan_earnings * s.quantity), 0) + COALESCE(SUM(s.commission_amount * s.quantity), 0) AS net_earnings
-             FROM sales s
-             JOIN shops sh ON s.shop_id = sh.id
-             JOIN products p ON s.product_id = p.id
-             WHERE ${salesWhereSql}
-             GROUP BY p.id, p.product_name
-             ORDER BY net_earnings DESC
-             LIMIT 20`,
-            salesParams
-          )
-        : Promise.resolve([]),
-      runQuery(
-        `SELECT
-           sh.shop_name,
-           COALESCE(sales_data.total_sales, 0) AS total_sales,
-           COALESCE(sales_data.shop_earnings, 0) AS shop_earnings,
-           COALESCE(advance_data.advance_payments, 0) AS advance_payments,
-           COALESCE(sales_data.total_sales, 0) - COALESCE(sales_data.shop_earnings, 0) - COALESCE(advance_data.advance_payments, 0) AS remaining_balance
-         FROM shops sh
-         LEFT JOIN (
-           SELECT s.shop_id, SUM(s.total_amount) AS total_sales, SUM(s.commission_amount * s.quantity) AS shop_earnings
-           FROM sales s
-           GROUP BY s.shop_id
-         ) sales_data ON sh.id = sales_data.shop_id
-         LEFT JOIN (
-           SELECT shop_id, SUM(amount) AS advance_payments
-           FROM advance_payments
-           GROUP BY shop_id
-         ) advance_data ON sh.id = advance_data.shop_id
-         WHERE sh.user_id = ? AND sh.status = 'active'
-         ORDER BY total_sales DESC`,
-        [user_id]
-      ),
+    const [shops, products, inventory, shopInventory, allSales, allReturns, allAdvances] = await Promise.all([
+      models.Shop.find({ user_id: uid }).lean(),
+      models.Product.find({ user_id: uid, status: "active" }).lean(),
+      models.MainInventory.find().lean(),
+      models.ShopInventory.find().lean(),
+      models.Sale.find().lean(),
+      models.Return.find().lean(),
+      models.AdvancePayment.find().lean(),
     ]);
 
-    report.summary = {
-      totalSales: Number(salesSummaryRows[0].totalSales || 0),
-      totalArtisanEarnings: Number(salesSummaryRows[0].totalArtisanEarnings || 0),
-      totalShopEarnings: Number(salesSummaryRows[0].totalShopEarnings || 0),
-      productsSold: Number(salesSummaryRows[0].productsSold || 0),
-      totalReturnsQuantity: Number(returnsSummaryRows[0].totalReturnsQuantity || 0),
-      totalReturnsValue: Number(returnsSummaryRows[0].totalReturnsValue || 0),
-      totalAdvancePayments: Number(advancesSummaryRows[0].totalAdvancePayments || 0),
+    const shopIds = new Set(shops.map((shop) => shop.id));
+    const productIds = new Set(products.map((product) => product.id));
+    const productById = new Map(products.map((product) => [product.id, product]));
+    const shopById = new Map(shops.map((shop) => [shop.id, shop]));
+    const inventoryByProduct = new Map(inventory.map((item) => [item.product_id, item.quantity]));
+
+    const filterCommon = (row) =>
+      shopIds.has(row.shop_id) &&
+      productIds.has(row.product_id) &&
+      inRange(row, range) &&
+      (!req.query.shop_id || req.query.shop_id === "all" || row.shop_id === helpers.toId(req.query.shop_id)) &&
+      (!req.query.product_id || req.query.product_id === "all" || row.product_id === helpers.toId(req.query.product_id));
+
+    const sales = includeSales ? allSales.filter(filterCommon) : [];
+    const returns = includeReturns ? allReturns.filter(filterCommon) : [];
+    const advances = includeAdvances
+      ? allAdvances.filter(
+          (row) =>
+            shopIds.has(row.shop_id) &&
+            inRange(row, range) &&
+            (!req.query.shop_id || req.query.shop_id === "all" || row.shop_id === helpers.toId(req.query.shop_id))
+        )
+      : [];
+
+    const totalSales = sales.reduce((sum, sale) => sum + helpers.toNumber(sale.total_amount), 0);
+    const totalArtisanEarnings = sales.reduce(
+      (sum, sale) => sum + helpers.toNumber(sale.artisan_earnings) * helpers.toNumber(sale.quantity),
+      0
+    );
+    const totalShopEarnings = sales.reduce(
+      (sum, sale) => sum + helpers.toNumber(sale.commission_amount) * helpers.toNumber(sale.quantity),
+      0
+    );
+
+    const salesByDate = groupSum(
+      sales,
+      (sale) => new Date(sale.created_at).toISOString().slice(0, 10),
+      (sale) => helpers.toNumber(sale.total_amount)
+    );
+
+    const salesByCategory = groupSum(
+      sales,
+      (sale) => productById.get(sale.product_id)?.category || "Uncategorized",
+      (sale) => helpers.toNumber(sale.quantity)
+    );
+
+    const salesByProduct = [...groupSum(sales, (sale) => sale.product_id, (sale) => helpers.toNumber(sale.quantity))]
+      .map(([productId, total_sold]) => {
+        const productSales = sales.filter((sale) => sale.product_id === productId);
+        return {
+          product_name: productById.get(productId)?.product_name,
+          product_code: productById.get(productId)?.product_code,
+          total_sold,
+          revenue: productSales.reduce((sum, sale) => sum + helpers.toNumber(sale.total_amount), 0),
+          artisan_earnings: productSales.reduce(
+            (sum, sale) => sum + helpers.toNumber(sale.artisan_earnings) * helpers.toNumber(sale.quantity),
+            0
+          ),
+          shop_earnings: productSales.reduce(
+            (sum, sale) => sum + helpers.toNumber(sale.commission_amount) * helpers.toNumber(sale.quantity),
+            0
+          ),
+        };
+      })
+      .sort((a, b) => b.total_sold - a.total_sold || b.revenue - a.revenue)
+      .slice(0, 10);
+
+    const salesByShop = [...groupSum(sales, (sale) => sale.shop_id, (sale) => helpers.toNumber(sale.total_amount))]
+      .map(([shopId, shopTotal]) => {
+        const shopSales = sales.filter((sale) => sale.shop_id === shopId);
+        return {
+          shop_name: shopById.get(shopId)?.shop_name,
+          total_sales: shopTotal,
+          products_sold: shopSales.reduce((sum, sale) => sum + helpers.toNumber(sale.quantity), 0),
+          artisan_earnings: shopSales.reduce(
+            (sum, sale) => sum + helpers.toNumber(sale.artisan_earnings) * helpers.toNumber(sale.quantity),
+            0
+          ),
+          shop_earnings: shopSales.reduce(
+            (sum, sale) => sum + helpers.toNumber(sale.commission_amount) * helpers.toNumber(sale.quantity),
+            0
+          ),
+        };
+      })
+      .sort((a, b) => b.total_sales - a.total_sales)
+      .slice(0, 10);
+
+    const report = {
+      ...emptyReport,
+      summary: {
+        totalSales,
+        totalArtisanEarnings,
+        totalShopEarnings,
+        productsSold: sales.reduce((sum, sale) => sum + helpers.toNumber(sale.quantity), 0),
+        totalReturnsQuantity: returns.reduce((sum, ret) => sum + helpers.toNumber(ret.quantity), 0),
+        totalReturnsValue: returns.reduce((sum, ret) => {
+          const product = productById.get(ret.product_id);
+          const shopItem = shopInventory.find((item) => item.shop_id === ret.shop_id && item.product_id === ret.product_id);
+          return sum + helpers.toNumber(ret.quantity) * helpers.toNumber(shopItem?.artisan_price || product?.base_price);
+        }, 0),
+        totalAdvancePayments: advances.reduce((sum, advance) => sum + helpers.toNumber(advance.amount), 0),
+      },
+      salesOverTime: [...salesByDate].map(([period, sales]) => ({ period, sales })).sort((a, b) => a.period.localeCompare(b.period)),
+      earningsComparison: [
+        { name: "Artisan Earnings", value: totalArtisanEarnings },
+        { name: "Shop Earnings", value: totalShopEarnings },
+      ],
+      topCategories: [...salesByCategory].map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value),
+      topProducts: salesByProduct,
+      topShops: salesByShop,
+      lowStock: products
+        .map((product) => {
+          const current_stock = helpers.toNumber(inventoryByProduct.get(product.id));
+          const minimum_stock = helpers.toNumber(product.minimum_stock);
+          return {
+            product_name: product.product_name,
+            current_stock,
+            minimum_stock,
+            status: current_stock <= 0 ? "Critical" : current_stock <= minimum_stock ? "Low" : "Safe",
+          };
+        })
+        .sort((a, b) => {
+          const rank = { Critical: 1, Low: 2, Safe: 3 };
+          return rank[a.status] - rank[b.status] || a.product_name.localeCompare(b.product_name);
+        }),
+      returnsReport: returns
+        .map((ret) => ({
+          created_at: ret.created_at,
+          product_name: productById.get(ret.product_id)?.product_name,
+          shop_name: shopById.get(ret.shop_id)?.shop_name,
+          quantity: ret.quantity,
+          reason: ret.reason,
+          status: ret.status,
+        }))
+        .sort(helpers.sortByDateDesc)
+        .slice(0, 50),
+      advancePayments: advances
+        .map((advance) => ({
+          shop_name: shopById.get(advance.shop_id)?.shop_name,
+          amount: advance.amount,
+          note: advance.note,
+          created_at: advance.created_at,
+        }))
+        .sort(helpers.sortByDateDesc)
+        .slice(0, 50),
+      inventoryMovement: products.map((product) => {
+        const assigned = shopInventory
+          .filter((item) => item.product_id === product.id)
+          .reduce((sum, item) => sum + helpers.toNumber(item.quantity), 0);
+        const sold = allSales
+          .filter((sale) => sale.product_id === product.id)
+          .reduce((sum, sale) => sum + helpers.toNumber(sale.quantity), 0);
+        const returned = allReturns
+          .filter((ret) => ret.product_id === product.id && ret.status === "confirmed")
+          .reduce((sum, ret) => sum + helpers.toNumber(ret.quantity), 0);
+        const remaining = helpers.toNumber(inventoryByProduct.get(product.id)) + assigned;
+
+        return {
+          product_name: product.product_name,
+          initial_quantity: remaining + sold + returned,
+          assigned: assigned + sold + returned,
+          sold,
+          returned,
+          damaged: 0,
+          remaining,
+        };
+      }),
+      profitability: salesByProduct
+        .map((item) => ({
+          product_name: item.product_name,
+          revenue: item.revenue,
+          artisan_profit: item.artisan_earnings,
+          shop_profit: item.shop_earnings,
+          net_earnings: item.artisan_earnings + item.shop_earnings,
+        }))
+        .sort((a, b) => b.net_earnings - a.net_earnings)
+        .slice(0, 20),
+      shopSettlement: await helpers.shopRowsForUser(uid, "active"),
     };
 
-    report.salesOverTime = salesOverTime;
-    report.earningsComparison = earningsComparison;
-    report.topCategories = topCategories;
-    report.topProducts = topProducts;
-    report.topShops = topShops;
-    report.lowStock = lowStock;
-    report.returnsReport = returnsReport;
-    report.advancePayments = advancePayments;
-    report.inventoryMovement = inventoryMovement;
-    report.profitability = profitability;
-    report.shopSettlement = shopSettlement;
+    report.shopSettlement = report.shopSettlement
+      .map((shop) => ({
+        shop_name: shop.shop_name,
+        total_sales: sales
+          .filter((sale) => sale.shop_id === shop.id)
+          .reduce((sum, sale) => sum + helpers.toNumber(sale.total_amount), 0),
+        shop_earnings: sales
+          .filter((sale) => sale.shop_id === shop.id)
+          .reduce((sum, sale) => sum + helpers.toNumber(sale.commission_amount) * helpers.toNumber(sale.quantity), 0),
+        advance_payments: advances
+          .filter((advance) => advance.shop_id === shop.id)
+          .reduce((sum, advance) => sum + helpers.toNumber(advance.amount), 0),
+        remaining_balance: shop.outstanding_balance,
+      }))
+      .sort((a, b) => b.total_sales - a.total_sales);
 
     res.json(report);
   } catch (err) {

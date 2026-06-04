@@ -2,6 +2,9 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+require('dotenv').config();
+
+const db = require('./db');
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -17,7 +20,11 @@ const reportRoutes = require("./routes/reportRoutes");
 const activityLogRoutes = require("./routes/activityLogRoutes");
 
 //Use
-app.use(cors());
+app.use(cors({
+    origin: '*',
+    credentials: false,
+    optionsSuccessStatus: 200
+}));
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
@@ -38,6 +45,17 @@ app.get('/test', (req, res) => {
 });
 
 
-app.listen(port, () => {
-    console.log(`Server is running on port ${port}`);
-});
+if (require.main === module) {
+    db.connect((err) => {
+        if (err) {
+            console.error('Database connection failed:', err);
+            process.exit(1);
+        }
+
+        app.listen(port, () => {
+            console.log(`Server is running on port ${port}`);
+        });
+    });
+}
+
+module.exports = { app };
