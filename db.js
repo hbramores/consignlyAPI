@@ -30,6 +30,7 @@ function likeSql(sql) {
 async function connect(callback) {
   if (!connectionPromise) {
     const uri = process.env.MONGODB_URI;
+    
 
     if (!uri) {
       connectionPromise = Promise.reject(
